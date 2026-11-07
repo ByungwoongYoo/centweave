@@ -1,0 +1,14 @@
+use centweave::Series
+
+// A separate ingot imports and calls the library; this does not transfer funds.
+#[test]
+fn importing_application_keeps_one_series_across_receipts() {
+    var royalties = Series::new(weights: [5, 3, 2, 0, 0, 0, 0, 0])
+    let first = royalties.push(amount: 3)
+    let next = royalties.try_push(amount: 5)
+    assert!(next.ok)
+    assert!(royalties.received() == 8)
+    assert!(first.units[0] + next.allocation.units[0] == 5)
+    assert!(first.units[1] + next.allocation.units[1] == 2)
+    assert!(first.units[2] + next.allocation.units[2] == 1)
+}

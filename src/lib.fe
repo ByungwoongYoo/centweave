@@ -1,0 +1,257 @@
+// CentWeave: deterministic, batching-invariant integer allocation.
+// The schedule is D'Hondt/Jefferson highest-averages ordering, not a new
+// allocation algorithm or fairness theorem. Exact virtual-finish ratios are
+// compared by integer cross-products.
+// Up to eight fixed recipients; zero weight disables a recipient.
+
+pub struct Allocation {
+    pub units: [u256; 8],
+}
+
+pub struct PushOutcome {
+    pub ok: bool,
+    pub allocation: Allocation,
+}
+
+// A series fixes both recipient order and weights. Reweighting creates a new
+// series; it never rewrites the old cursor or claws back an earlier allocation.
+pub struct Series {
+    weights: [u256; 8],
+    received: u256,
+}
+
+impl Series {
+    pub fn new(weights: [u256; 8]) -> Self {
+        let _ = denominator(weights: weights)
+        Self { weights, received: 0 }
+    }
+
+    pub fn received(self) -> u256 { self.received }
+
+    // A recoverable overflow rejection leaves the existing cursor untouched.
+    pub fn try_push(self: mut Self, amount: u256) -> PushOutcome {
+        let max: u256 = 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+        if amount > max - self.received {
+            return PushOutcome { ok: false, allocation: Allocation { units: [0; 8] } }
+        }
+        let result = allocate(weights: self.weights, already: self.received, amount: amount)
+        self.received += amount
+        PushOutcome { ok: true, allocation: result }
+    }
+
+    pub fn push(self: mut Self, amount: u256) -> Allocation {
+        let result = allocate(weights: self.weights, already: self.received, amount: amount)
+        self.received += amount
+        result
+    }
+}
+
+pub fn denominator(weights: [u256; 8]) -> u256 {
+    var total: u256 = 0
+    for i in 0..8 {
+        assert!(weights[i] <= 10000, "weight too large")
+        total += weights[i]
+    }
+    assert!(total > 0 && total <= 10000, "invalid weight sum")
+    total
+}
+
+// Return the first `through` units of the fixed virtual-finish schedule.
+// Full periods are skipped; only the final partial period is traversed.
+pub fn prefix(weights: [u256; 8], through: u256) -> Allocation {
+    let period = denominator(weights: weights)
+    let cycles = through / period
+    let tail = through % period
+    var small: [u256; 8] = [0; 8]
+    var result: [u256; 8] = [0; 8]
+    for step in 0..(tail as usize) {
+        var best: usize = 8
+        for i in 0..8 {
+            if weights[i] > 0 {
+                if best == 8 {
+                    best = i
+                } else {
+                    // Exact rational comparison; stable index order breaks ties.
+                    if (small[i] + 1) * weights[best] < (small[best] + 1) * weights[i] {
+                        best = i
+                    }
+                }
+            }
+        }
+        small[best] += 1
+    }
+    for i in 0..8 {
+        result[i] = cycles * weights[i] + small[i]
+    }
+    Allocation { units: result }
+}
+
+// `already` is the cumulative units under this exact, fixed weight vector.
+// Changing recipients/weights starts a new series, with already=0.
+pub fn allocate(weights: [u256; 8], already: u256, amount: u256) -> Allocation {
+    let before = prefix(weights: weights, through: already)
+    let after = prefix(weights: weights, through: already + amount)
+    var units: [u256; 8] = [0; 8]
+    for i in 0..8 {
+        units[i] = after.units[i] - before.units[i]
+    }
+    Allocation { units }
+}
+
+#[test]
+fn one_cent_receipts_reach_every_collaborator() {
+    let w: [u256; 8] = [5, 3, 2, 0, 0, 0, 0, 0]
+    var paid: [u256; 8] = [0; 8]
+    for t in 0..10 {
+        let a = allocate(weights: w, already: t as u256, amount: 1)
+        var sum: u256 = 0
+        for i in 0..8 {
+            paid[i] += a.units[i]
+            sum += a.units[i]
+        }
+        assert!(sum == 1)
+    }
+    assert!(paid[0] == 5 && paid[1] == 3 && paid[2] == 2)
+    assert!(paid[3] == 0)
+}
+
+#[test]
+fn partition_invariance_and_zero_amount() {
+    let w: [u256; 8] = [7, 2, 1, 0, 0, 0, 0, 0]
+    for a in 0..16 {
+        for b in 0..16 {
+            let first = allocate(weights: w, already: 3, amount: a as u256)
+            let next = allocate(weights: w, already: 3 + a as u256, amount: b as u256)
+            let one = allocate(weights: w, already: 3, amount: (a + b) as u256)
+            for i in 0..8 {
+                assert!(first.units[i] + next.units[i] == one.units[i])
+            }
+        }
+    }
+}
+
+#[test]
+fn exact_period_and_large_amount() {
+    let w: [u256; 8] = [3333, 3333, 3334, 0, 0, 0, 0, 0]
+    let a = allocate(weights: w, already: 0, amount: 1000000000000000000)
+    assert!(a.units[0] == 333300000000000000)
+    assert!(a.units[1] == 333300000000000000)
+    assert!(a.units[2] == 333400000000000000)
+}
+
+#[test]
+fn exhaustive_small_weights_conserve_and_never_claw_back() {
+    for a in 0..4 {
+        for b in 0..4 {
+            for c in 0..4 {
+                if a + b + c > 0 {
+                    let w: [u256; 8] = [a as u256, b as u256, c as u256, 0, 0, 0, 0, 0]
+                    for t in 0..20 {
+                        let result = allocate(weights: w, already: t as u256, amount: 1)
+                        var sum: u256 = 0
+                        for i in 0..8 { sum += result.units[i] }
+                        assert!(sum == 1)
+                        if a == 0 { assert!(result.units[0] == 0) }
+                        if b == 0 { assert!(result.units[1] == 0) }
+                        if c == 0 { assert!(result.units[2] == 0) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test(should_revert)]
+fn rejects_zero_weights() {
+    let _ = allocate(weights: [0; 8], already: 0, amount: 1)
+}
+
+#[test(should_revert)]
+fn rejects_excessive_denominator() {
+    let _ = allocate(weights: [10000, 1, 0, 0, 0, 0, 0, 0], already: 0, amount: 1)
+}
+
+#[test(should_revert)]
+fn rejects_cumulative_overflow() {
+    let max: u256 = 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+    let _ = allocate(weights: [1, 0, 0, 0, 0, 0, 0, 0], already: max, amount: 1)
+}
+
+#[test]
+fn series_cursor_is_owned_and_reweighting_starts_another_series() {
+    var old = Series::new(weights: [5, 3, 2, 0, 0, 0, 0, 0])
+    let first = old.push(amount: 3)
+    let second = old.push(amount: 7)
+    assert!(old.received() == 10)
+    assert!(first.units[0] + second.units[0] == 5)
+    assert!(first.units[1] + second.units[1] == 3)
+    assert!(first.units[2] + second.units[2] == 2)
+    var replacement = Series::new(weights: [1, 1, 0, 0, 0, 0, 0, 0])
+    let _ = replacement.push(amount: 2)
+    assert!(replacement.received() == 2)
+    assert!(old.received() == 10)
+}
+
+#[test]
+fn cumulative_amounts_do_not_claw_back_in_alabama_example() {
+    let w: [u256; 8] = [1500, 1500, 900, 500, 500, 200, 0, 0]
+    let a = prefix(weights: w, through: 25)
+    let b = prefix(weights: w, through: 26)
+    var added: u256 = 0
+    for i in 0..8 {
+        assert!(b.units[i] >= a.units[i])
+        added += b.units[i] - a.units[i]
+    }
+    assert!(added == 1)
+}
+
+#[test]
+fn max_u256_input_preserves_every_unit() {
+    let max: u256 = 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+    let a = prefix(weights: [5, 3, 2, 0, 0, 0, 0, 0], through: max)
+    assert!(a.units[0] + a.units[1] + a.units[2] == max)
+}
+
+#[test]
+fn largest_supported_partial_period_conserves_units() {
+    let a = prefix(weights: [3333, 3333, 3334, 0, 0, 0, 0, 0], through: 9999)
+    assert!(a.units[0] + a.units[1] + a.units[2] == 9999)
+}
+
+#[test]
+fn eight_units_compare_with_cumulative_floor_and_its_dust() {
+    let w: [u256; 8] = [5, 3, 2, 0, 0, 0, 0, 0]
+    let a = prefix(weights: w, through: 8)
+    assert!(a.units[0] == 5 && a.units[1] == 2 && a.units[2] == 1)
+    var floor_sum: u256 = 0
+    for i in 0..8 { floor_sum += 8 * w[i] / 10 }
+    assert!(8 * w[0] / 10 == 4)
+    assert!(8 * w[1] / 10 == 2)
+    assert!(8 * w[2] / 10 == 1)
+    assert!(8 - floor_sum == 1)
+}
+
+#[test]
+fn failed_try_push_preserves_cursor_then_valid_input_succeeds() {
+    let max: u256 = 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+    var series = Series::new(weights: [1, 0, 0, 0, 0, 0, 0, 0])
+    let _ = series.push(amount: max - 2)
+    let rejected = series.try_push(amount: 3)
+    assert!(!rejected.ok)
+    assert!(series.received() == max - 2)
+    for i in 0..8 { assert!(rejected.allocation.units[i] == 0) }
+    let accepted = series.try_push(amount: 2)
+    assert!(accepted.ok)
+    assert!(accepted.allocation.units[0] == 2)
+    assert!(series.received() == max)
+}
+
+#[test]
+fn worst_two_tails_eight_active_recipients() {
+    let w: [u256; 8] = [1250; 8]
+    let a = allocate(weights: w, already: 9999, amount: 10000)
+    var sum: u256 = 0
+    for i in 0..8 { sum += a.units[i] }
+    assert!(sum == 10000)
+    for i in 0..8 { assert!(a.units[i] == 1250) }
+}

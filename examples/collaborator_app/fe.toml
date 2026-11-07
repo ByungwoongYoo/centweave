@@ -1,0 +1,6 @@
+[ingot]
+name = "collaborator_app"
+version = "0.1.0"
+
+[dependencies]
+centweave = { path = "../.." }
